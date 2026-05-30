@@ -89,7 +89,7 @@ Boolean MultiFramedRTPSink
 
 unsigned MultiFramedRTPSink::specialHeaderSize() const {
   // default implementation: Assume no special header:
-  return 0;
+  return 68;
 }
 
 unsigned MultiFramedRTPSink::frameSpecificHeaderSize() const {
@@ -105,6 +105,12 @@ unsigned MultiFramedRTPSink::computeOverflowForNewFrame(unsigned newFrameSize) c
 void MultiFramedRTPSink::setMarkerBit() {
   unsigned rtpHdr = fOutBuf->extractWord(0);
   rtpHdr |= 0x00800000;
+  fOutBuf->insertWord(rtpHdr, 0);
+}
+
+void MultiFramedRTPSink::setExtensionBit() {
+  unsigned rtpHdr = fOutBuf->extractWord(0);
+  rtpHdr |= 0x10000000;
   fOutBuf->insertWord(rtpHdr, 0);
 }
 

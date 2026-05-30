@@ -23,6 +23,16 @@ along with this library; if not, write to the Free Software Foundation, Inc.,
 #include "RTCP.hh"
 #include "GroupsockHelper.hh"
 #include <string.h>
+#include <stdio.h>
+#include <stdint.h>
+#include "H264or5VideoRTPSink.hh"
+
+#define RX_NAL_BUF_MAX (64 * 1024)
+
+static unsigned char s_rxNALBuf[RX_NAL_BUF_MAX];
+static unsigned      s_rxNALBytes  = 0;
+static int           s_rxInFUA     = 0; // 1 while accumulating FU-A fragments
+static int           s_rxOverflow  = 0; // 1 if NAL exceeded buffer (skip verify)
 
 ////////// ReorderingPacketBuffer definition //////////
 
@@ -226,6 +236,21 @@ void MultiFramedRTPSource::networkReadHandler(MultiFramedRTPSource* source, int 
   source->networkReadHandler1();
 }
 
+int recvpendingSignatureNParts = 2;
+uint8_t recvpendingSignatureData[FRAME_SIGNATURE_SIZE] = {0};
+
+struct signaturePacket {
+  uint8_t hdr1[2];
+  uint8_t seg1[201];
+  uint8_t hdr2[2];
+  uint8_t seg2[201];
+  uint8_t hdr3[2];
+  uint8_t seg3[201];
+  uint8_t hdr4[2];
+  uint8_t seg4[201];
+};
+
+
 void MultiFramedRTPSource::networkReadHandler1() {
   BufferedPacket* bPacket = fPacketReadInProgress;
   if (bPacket == NULL) {
@@ -293,13 +318,122 @@ void MultiFramedRTPSource::networkReadHandler1() {
     if (bPacket->dataSize() < cc*4) break;
     ADVANCE(cc*4);
 
-    // Check for (& ignore) any RTP header extension
+    // Parse RTP header extension (if present)
     if (rtpHdr&0x10000000) {
       if (bPacket->dataSize() < 4) break;
       unsigned extHdr = ntohl(*(u_int32_t*)(bPacket->data())); ADVANCE(4);
       unsigned remExtSize = 4*(extHdr&0xFFFF);
       if (bPacket->dataSize() < remExtSize) break;
+
+      // Decode our custom frame-signature extension.
+      // Format: RFC 5285 two-byte header (profile=0x1001)
+      unsigned short extProfile = (unsigned short)((extHdr >> 16) & 0xFFFF);
+      if (extProfile == 0x1001 && remExtSize >= 6) {
+        const unsigned char* p = (const unsigned char*)bPacket->data();
+        if (p[0] == 0x01 && p[1] == 0xca) {  // ID=1, length=4
+          struct signaturePacket *pk1 = (struct signaturePacket*) p;
+          memcpy(recvpendingSignatureData+recvpendingSignatureNParts*(4*sizeof(pk1->seg1)), &pk1->seg1, sizeof(pk1->seg1));
+          memcpy(recvpendingSignatureData+recvpendingSignatureNParts*(4*sizeof(pk1->seg1))+sizeof(pk1->seg1), &pk1->seg2, sizeof(pk1->seg2));
+          memcpy(recvpendingSignatureData+recvpendingSignatureNParts*(4*sizeof(pk1->seg1))+sizeof(pk1->seg1)+sizeof(pk1->seg2), &pk1->seg3, sizeof(pk1->seg3));
+          memcpy(recvpendingSignatureData+recvpendingSignatureNParts*(4*sizeof(pk1->seg1))+sizeof(pk1->seg1)+sizeof(pk1->seg2)+sizeof(pk1->seg3), &pk1->seg4, sizeof(pk1->seg4));
+          recvpendingSignatureNParts--;
+          #ifdef DEBUG
+          printf("Received pointer: %d\n", recvpendingSignatureNParts);
+          rxChecksum = ((u_int32_t)p[2] << 24) | ((u_int32_t)p[3] << 16)
+                     | ((u_int32_t)p[4] <<  8) | (u_int32_t)p[5];
+          if (rxChecksum != 0) {
+            fprintf(stdout, "[RTP RECV] seq=%-5u  checksum=0x%08X\n",
+                    (unsigned short)(rtpHdr & 0xFFFF), rxChecksum);
+            fflush(stdout);
+          }
+          #endif
+        }
+      }
+
       ADVANCE(remExtSize);
+    }
+
+    // ---- Receiver-side checksum verification ----
+    {
+      const unsigned char* pl  = (const unsigned char*)bPacket->data();
+      unsigned             psz = bPacket->dataSize();
+      if (psz >= 1) {
+        unsigned char nalType = pl[0] & 0x1F;
+        if (nalType == 28 && psz >= 2) {
+          // FU-A fragment
+          unsigned char fuHdr    = pl[1];
+          int           isFuStart = (fuHdr & 0x80) != 0;
+          int           isFuEnd   = (fuHdr & 0x40) != 0;
+          // Data payload starts at pl[2]; pl[0]=FU indicator, pl[1]=FU header
+          const unsigned char* data     = pl + 2;
+          unsigned             dataSize = (psz >= 2) ? psz - 2 : 0;
+
+          if (isFuStart) {
+            // Reconstruct original NAL header and begin buffering
+            s_rxNALBytes  = 0;
+            s_rxOverflow  = 0;
+            s_rxInFUA     = 1;
+            unsigned char nalHdr = (pl[0] & 0xE0) | (fuHdr & 0x1F);
+            if (s_rxNALBytes < RX_NAL_BUF_MAX) {
+              s_rxNALBuf[s_rxNALBytes++] = nalHdr;
+            } else { s_rxOverflow = 1; }
+            #ifdef DEBUG
+            printf("Overflow is %d\n", s_rxOverflow);
+            #endif
+          }
+
+          if (s_rxInFUA && !s_rxOverflow) {
+            if (s_rxNALBytes + dataSize <= RX_NAL_BUF_MAX) {
+              memcpy(s_rxNALBuf + s_rxNALBytes, data, dataSize);
+              s_rxNALBytes += dataSize;
+            } else {
+              s_rxOverflow = 1;
+              fprintf(stderr, "[CHECKSUM] NAL too large for rx buffer (%u bytes); skipping\n",
+                      s_rxNALBytes + dataSize);
+            }
+          }
+
+          if (isFuEnd && s_rxInFUA) {
+            if (!s_rxOverflow) {
+              if (recvpendingSignatureNParts < 0) {
+                #ifdef DEBUG
+                for(int i=0; i<2420; ++i) {
+                  printf("%x", recvpendingSignatureData[i]);
+                }
+                printf("\n");
+                #endif
+                recvpendingSignatureNParts = 2;
+              }
+              #ifdef DEBUG
+              u_int32_t computed = computeSignature(s_rxNALBuf, s_rxNALBytes);
+              fprintf(stdout, "[CHECKSUM %s] expected=0x%08X  computed=0x%08X\n",
+                      computed == rxChecksum ? "OK  " : "FAIL",
+                      rxChecksum, computed);
+              fflush(stdout);
+              #endif
+            }
+            s_rxInFUA    = 0;
+            s_rxNALBytes = 0;
+            s_rxOverflow = 0;
+          }
+
+        } else if (nalType >= 1 && nalType <= 23) {
+          // Single NAL unit packet — the payload IS the complete NAL
+            computeSignature(pl, psz, recvpendingSignatureData);
+
+            #ifdef DEBUG
+            printf("CALCULATED: \n");
+            for(int i=0; i<2420; ++i) {
+              printf("%x", recvpendingSignatureData[i]);
+            }
+            printf("\n");
+            #endif
+
+          s_rxInFUA    = 0;
+          s_rxNALBytes = 0;
+          s_rxOverflow = 0;
+        }
+      }
     }
 
     // Discard any padding bytes:
@@ -358,20 +492,7 @@ BufferedPacket::BufferedPacket()
 }
 
 BufferedPacket::~BufferedPacket() {
-  /////
-  // Replace tail recursion with iteration, in case the compiler isn't smart enough to do this.
-  // I.e., replace:
-  //    delete fNextPacket;
-  // with:
-  BufferedPacket* nextPacket = fNextPacket;
-  while (nextPacket != NULL) {
-    BufferedPacket* tmpPacket = nextPacket;
-    nextPacket = tmpPacket->fNextPacket;
-    tmpPacket->fNextPacket = NULL;
-    delete tmpPacket;
-  }
-  /////
-
+  delete fNextPacket;
   delete[] fBuf;
 }
 

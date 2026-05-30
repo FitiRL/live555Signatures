@@ -28,6 +28,18 @@ along with this library; if not, write to the Free Software Foundation, Inc.,
 #include "FramedFilter.hh"
 #endif
 
+#define FRAME_SIGNATURE_SIZE 2424
+
+enum SignatureMode {
+  SIGNATURE_EVERY_PACKET,   // Attach a checksum to every RTP packet
+  SIGNATURE_KEYFRAME_ONLY   // Attach a checksum only to keyframe (IDR) packets
+};
+
+extern SignatureMode g_SignatureMode;
+
+#include <stdint.h>
+int computeSignature(const unsigned char* data, unsigned size, unsigned char* signature);
+
 class H264or5VideoRTPSink: public VideoRTPSink {
 protected:
   H264or5VideoRTPSink(int hNumber, // 264 or 265
@@ -47,6 +59,7 @@ private: // redefined virtual functions:
                                       unsigned numRemainingBytes);
   virtual Boolean frameCanAppearAfterPacketStart(unsigned char const* frameStart,
 						 unsigned numBytesInFrame) const;
+  virtual unsigned specialHeaderSize() const;
 
 protected:
   int fHNumber;

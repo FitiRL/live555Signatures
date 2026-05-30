@@ -78,6 +78,7 @@ protected:
   Boolean isFirstFrameInPacket() const { return fNumFramesUsedSoFar == 0; }
   unsigned curFragmentationOffset() const { return fCurFragmentationOffset; }
   void setMarkerBit();
+  void setExtensionBit();
   void setTimestamp(struct timeval framePresentationTime);
   void setSpecialHeaderWord(unsigned word, /* 32 bits, in host order */
 			    unsigned wordPosition = 0);

@@ -20,6 +20,48 @@ along with this library; if not, write to the Free Software Foundation, Inc.,
 
 #include "H264or5VideoRTPSink.hh"
 #include "H264or5VideoStreamFramer.hh"
+#include <stdint.h>
+#include <stdio.h>
+
+// If hardware acceleration is enabled, the signature is done in the hardware
+// (fpga core by using the specific driver).
+// #define HW_ACCELERATION 1
+
+#ifdef HW_ACCELERATION
+#define CONTEXT_LENGTH 16
+static uint8_t context[CONTEXT_LENGTH] = {0}; // Initialize the context data
+#endif
+
+// Checksum can be calculated every packet or only for keyframe.
+SignatureMode g_SignatureMode = SIGNATURE_EVERY_PACKET;
+
+// This function is just an example of checksum calculation. The checksum is
+// 
+int computeSignature(const unsigned char* data, unsigned size, unsigned char* signature) {
+  #ifdef HW_ACCELERATION
+  pqb_error_code_t result = wait_for_hardware_ready(hif);
+  if (result != PQB_SUCCESS) {
+    return 0;
+  }
+
+  uint32_t* signature;
+  result = pqb_dsa_sign_mldsa_44(hif, signature, data, size, context, 
+    CONTEXT_LENGTH);
+  if (result != PQB_SUCCESS) {
+    PQB_PRINTF("ERROR: Signing failed with status %d (%s)\n", result, 
+      pqb_core_error_string(result));
+    return -1;
+  }
+
+  return 0;
+  #else
+  // If not accelerated via hardware, the signature is just an example (checksum).
+  for (unsigned i = 0; i < FRAME_SIGNATURE_SIZE; ++i) {
+    signature[i] = 0x33; // DEBUG ONLY
+  }
+  return 0;
+  #endif
+}
 
 ////////// H264or5Fragmenter definition //////////
 
@@ -37,6 +79,7 @@ public:
   virtual ~H264or5Fragmenter();
 
   Boolean lastFragmentCompletedNALUnit() const { return fLastFragmentCompletedNALUnit; }
+  uint8_t* nalSignature() { return fNALSignature; }
 
 private: // redefined virtual functions:
   virtual void doGetNextFrame();
@@ -62,6 +105,7 @@ private:
   unsigned fCurDataOffset;
   unsigned fSaveNumTruncatedBytes;
   Boolean fLastFragmentCompletedNALUnit;
+  uint8_t fNALSignature[FRAME_SIGNATURE_SIZE]; // signature of the full NAL unit, computed before fragmentation
 };
 
 
@@ -117,7 +161,7 @@ Boolean H264or5VideoRTPSink::continuePlaying() {
   // If not, create it now:
   if (fOurFragmenter == NULL) {
     fOurFragmenter = new H264or5Fragmenter(fHNumber, envir(), fSource, OutPacketBuffer::maxSize,
-					   ourMaxPacketSize() - 12/*RTP hdr size*/);
+					   ourMaxPacketSize() - 12/*RTP hdr size*/ - specialHeaderSize());
   } else {
     fOurFragmenter->reassignInputSource(fSource);
   }
@@ -127,19 +171,117 @@ Boolean H264or5VideoRTPSink::continuePlaying() {
   return MultiFramedRTPSink::continuePlaying();
 }
 
+int pendingSignatureNParts = 0; // keep the count of how many parts the signature is split
+uint8_t pendingSignatureData[2424] = {0};
+
+unsigned H264or5VideoRTPSink::specialHeaderSize() const {
+  if (pendingSignatureNParts > 0) {
+    return 820; // Size of the header size required. Padding is applied.
+  } else {
+    return 0;
+  }
+}
+
+// TODO: Improve this to manage the size dynamically. We use 4 parts by now, fixed.
+struct signaturePacket {
+  uint8_t hdr1[2];
+  uint8_t seg1[202];
+  uint8_t hdr2[2];
+  uint8_t seg2[202];
+  uint8_t hdr3[2];
+  uint8_t seg3[202];
+  uint8_t hdr4[2];
+  uint8_t seg4[202];
+};
+
 void H264or5VideoRTPSink::doSpecialFrameHandling(unsigned /*fragmentationOffset*/,
-						 unsigned char* /*frameStart*/,
-						 unsigned /*numBytesInFrame*/,
+						 unsigned char* frameStart,
+						 unsigned numBytesInFrame,
 						 struct timeval framePresentationTime,
 						 unsigned /*numRemainingBytes*/) {
-  // Set the RTP 'M' (marker) bit iff
-  // 1/ The most recently delivered fragment was the end of (or the only fragment of) an NAL unit, and
-  // 2/ This NAL unit was the last NAL unit of an 'access unit' (i.e. video frame).
   if (fOurFragmenter != NULL) {
     H264or5VideoStreamFramer* framerSource
       = (H264or5VideoStreamFramer*)(fOurFragmenter->inputSource());
-    // This relies on our fragmenter's source being a "H264or5VideoStreamFramer".
-    if (((H264or5Fragmenter*)fOurFragmenter)->lastFragmentCompletedNALUnit()
+
+    // ---- Keyframe detection ----
+    // H.264: IDR = NAL type 5.  FU-A = NAL type 28; underlying type in [1]&0x1F.
+    // H.265: IDR_W_RADL/IDR_N_LP = types 19/20.  FU = type 49; underlying in [2]&0x3F.
+    bool isKeyframe = false;
+    uint8_t rawNalType = 0;
+    if (numBytesInFrame >= 1) {
+      if (fHNumber == 264) {
+        rawNalType = frameStart[0] & 0x1F;
+        if (rawNalType == 5) {
+          isKeyframe = true;
+        } else if (rawNalType == 28 && numBytesInFrame >= 2) {
+          uint8_t fuUnderlying = frameStart[1] & 0x1F;
+          rawNalType = fuUnderlying;
+          isKeyframe = (fuUnderlying == 5);
+        }
+      } else { // H.265
+        rawNalType = (frameStart[0] & 0x7E) >> 1;
+        if (rawNalType == 19 || rawNalType == 20) {
+          isKeyframe = true;
+        } else if (rawNalType == 49 && numBytesInFrame >= 3) {
+          uint8_t fuUnderlying = frameStart[2] & 0x3F;
+          rawNalType = fuUnderlying;
+          isKeyframe = (fuUnderlying == 19 || fuUnderlying == 20);
+        }
+      }
+    }
+
+    // ---- Checksum from the fragmenter (computed over the full NAL unit) ----
+    // All RTP fragments of the same NAL unit share the same value because it
+    // was computed once in afterGettingFrame1() before any fragmentation.
+    H264or5Fragmenter* frag = (H264or5Fragmenter*)fOurFragmenter;
+    bool isLastFragment = frag->lastFragmentCompletedNALUnit();
+
+    if (isKeyframe && isLastFragment) {
+      // First packet that contains the signature
+      pendingSignatureNParts = 3;
+
+      memcpy(pendingSignatureData, frag->nalSignature(), sizeof(pendingSignatureData));
+      #ifdef DEBUG
+      for(int i=0; i<2420; ++i) {
+        printf("%x", pendingSignatureData[i]);
+      }
+      printf("\n");
+      #endif
+
+    } else {
+      if (pendingSignatureNParts > 0) {
+        pendingSignatureNParts--;
+        // ---- Write RTP header extension ----
+        // The 8-byte slot is always reserved by specialHeaderSize(); we always
+        // fill it so the H.264 payload lands at the correct offset.
+        setExtensionBit();
+
+        // Extension header: profile=0x1001 (our custom tag), length=1 (one 32-bit word)
+        const unsigned char extHdr[] = { 0x10, 0x01, 0x00, 0xcc };
+        setSpecialHeaderBytes(extHdr, 4, 0);
+
+        struct signaturePacket pk1 = {0};
+        
+        pk1.hdr4[0]=0x01;pk1.hdr4[1]=0xca;  memcpy(&pk1.seg4, pendingSignatureData + (sizeof(pk1.seg4)*3) + (pendingSignatureNParts*sizeof(pk1.seg4)*4), sizeof(pk1.seg4));
+        pk1.hdr3[0]=0x01;pk1.hdr3[1]=0xca;  memcpy(&pk1.seg3, pendingSignatureData + (sizeof(pk1.seg4)*2) + (pendingSignatureNParts*sizeof(pk1.seg4)*4), sizeof(pk1.seg4));
+        pk1.hdr2[0]=0x01;pk1.hdr2[1]=0xca;  memcpy(&pk1.seg2, pendingSignatureData + (sizeof(pk1.seg4)*1) + (pendingSignatureNParts*sizeof(pk1.seg4)*4), sizeof(pk1.seg4));
+        pk1.hdr1[0]=0x01;pk1.hdr1[1]=0xca;  memcpy(&pk1.seg1, pendingSignatureData + (sizeof(pk1.seg4)*0) + (pendingSignatureNParts*sizeof(pk1.seg4)*4), sizeof(pk1.seg4));
+
+        setSpecialHeaderBytes((unsigned char*)&pk1, sizeof(pk1), 4);
+
+        #ifdef DEBUG
+        fprintf(stdout, "[RTP SEND] nalType=%-2u  %-8s  lastFrag=%d  bytes=%-5u \n",
+                rawNalType,
+                isKeyframe ? "[IDR]" : "",
+                isLastFragment ? 1 : 0,
+                numBytesInFrame
+                );
+        fflush(stdout);
+        #endif
+      }
+    }
+
+  if (((H264or5Fragmenter*)fOurFragmenter)->lastFragmentCompletedNALUnit()
 	&& framerSource != NULL && framerSource->pictureEndMarker()) {
       setMarkerBit();
       framerSource->pictureEndMarker() = False;
@@ -287,6 +429,11 @@ void H264or5Fragmenter::afterGettingFrame1(unsigned frameSize,
   fSaveNumTruncatedBytes = numTruncatedBytes;
   fPresentationTime = presentationTime;
   fDurationInMicroseconds = durationInMicroseconds;
+
+  // Compute signature over the *complete* NAL unit now, before it gets
+  // fragmented.  fInputBuffer[1] is the first byte of the NAL unit;
+  // frameSize is the number of valid NAL bytes.
+  computeSignature(&fInputBuffer[1], frameSize, fNALSignature);
 
   // Deliver data to the client:
   doGetNextFrame();
